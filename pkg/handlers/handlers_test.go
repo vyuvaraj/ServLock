@@ -227,3 +227,73 @@ func TestLockQueueingAndFairness(t *testing.T) {
 		t.Fatal(err3)
 	}
 }
+
+func TestLockObservability(t *testing.T) {
+	Store = storage.NewInMemoryStore()
+
+	// 1. Acquire lock
+	p1 := LockRequest{
+		Key:      "resource-Obs",
+		Owner:    "owner-1",
+		Duration: 5000,
+	}
+	b1, _ := json.Marshal(p1)
+	req1 := httptest.NewRequest("POST", "/api/locks/acquire", bytes.NewReader(b1))
+	rr1 := httptest.NewRecorder()
+	HandleAcquireLock(rr1, req1)
+	if rr1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr1.Code)
+	}
+
+	// 2. Start two waiters in background
+	go func() {
+		p2 := LockRequest{
+			Key:      "resource-Obs",
+			Owner:    "waiter-1",
+			Duration: 5000,
+			WaitTime: 2000,
+		}
+		b2, _ := json.Marshal(p2)
+		req2 := httptest.NewRequest("POST", "/api/locks/acquire", bytes.NewReader(b2))
+		rr2 := httptest.NewRecorder()
+		HandleAcquireLock(rr2, req2)
+	}()
+
+	go func() {
+		p3 := LockRequest{
+			Key:      "resource-Obs",
+			Owner:    "waiter-2",
+			Duration: 5000,
+			WaitTime: 2000,
+		}
+		b3, _ := json.Marshal(p3)
+		req3 := httptest.NewRequest("POST", "/api/locks/acquire", bytes.NewReader(b3))
+		rr3 := httptest.NewRecorder()
+		HandleAcquireLock(rr3, req3)
+	}()
+
+	// Wait for queue entry
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. Call observability endpoint
+	reqObs := httptest.NewRequest("GET", "/api/locks/observability", nil)
+	rrObs := httptest.NewRecorder()
+	HandleLockObservability(rrObs, reqObs)
+	if rrObs.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for observability, got %d", rrObs.Code)
+	}
+
+	var locks []storage.LockInfo
+	json.NewDecoder(rrObs.Body).Decode(&locks)
+
+	if len(locks) != 1 {
+		t.Fatalf("expected exactly 1 lock, got %d", len(locks))
+	}
+	lock := locks[0]
+	if lock.Key != "resource-Obs" || lock.Owner != "owner-1" {
+		t.Errorf("unexpected lock owner/key: %+v", lock)
+	}
+	if len(lock.Waiters) != 2 {
+		t.Errorf("expected 2 waiters, got %d: %+v", len(lock.Waiters), lock.Waiters)
+	}
+}

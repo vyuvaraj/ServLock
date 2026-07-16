@@ -172,3 +172,21 @@ func httpError(w http.ResponseWriter, r *http.Request, msg string, status int) {
 	}
 	ServShared.WriteJSONError(w, r, msg, errorCode, status)
 }
+
+func HandleLockObservability(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpError(w, r, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ims, ok := Store.(*storage.InMemoryStore)
+	if !ok {
+		httpError(w, r, "Observability is only supported for InMemoryStore", http.StatusNotImplemented)
+		return
+	}
+
+	locks := ims.GetActiveLocks()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(locks)
+}

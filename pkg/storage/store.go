@@ -197,3 +197,35 @@ func (s *InMemoryStore) startExpiryCleaner(interval time.Duration) {
 		s.mu.Unlock()
 	}
 }
+
+type LockInfo struct {
+	Key          string    `json:"key"`
+	Owner        string    `json:"owner"`
+	FencingToken int64     `json:"fencing_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Waiters      []string  `json:"waiters"`
+}
+
+func (s *InMemoryStore) GetActiveLocks() []LockInfo {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var res []LockInfo
+	now := time.Now()
+	for k, lock := range s.locks {
+		if lock.ExpiresAt.After(now) {
+			var waitList []string
+			for _, w := range s.waiters[k] {
+				waitList = append(waitList, w.owner)
+			}
+			res = append(res, LockInfo{
+				Key:          lock.Key,
+				Owner:        lock.Owner,
+				FencingToken: lock.FencingToken,
+				ExpiresAt:    lock.ExpiresAt,
+				Waiters:      waitList,
+			})
+		}
+	}
+	return res
+}
