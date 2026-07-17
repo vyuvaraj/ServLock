@@ -106,3 +106,9 @@ Retrieves list of active leases along with queued waiters.
 #### Prometheus Metrics
 Retrieves Prometheus gauges/counters.
 * **Endpoint**: `GET /api/locks/metrics`
+
+---
+
+## License
+
+This project is licensed under the GNU Affero General Public License v3 (AGPL-3.0) - see the [LICENSE](LICENSE) file for details.
