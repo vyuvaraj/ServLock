@@ -462,9 +462,6 @@ func (s *InMemoryStore) startExpiryCleaner(interval time.Duration) {
 	}
 }
 
-func (s *InMemoryStore) replicateState() {
-	log.Println("[Raft] Replicating lock state to consensus peer group...")
-}
 
 type LockInfo struct {
 	Key          string    `json:"key"`
