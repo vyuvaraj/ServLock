@@ -25,6 +25,11 @@ type waiter struct {
 	granted  chan *Lock
 }
 
+type LockEvent struct {
+	Key    string `json:"key"`
+	Action string `json:"action"` // "released" or "expired"
+}
+
 // LockBackend defines the interface for distributed lock backends.
 type LockBackend interface {
 	Acquire(key string, owner string, clientID string, ttl time.Duration) (*Lock, error)
@@ -32,6 +37,8 @@ type LockBackend interface {
 	Release(key string, owner string, fencingToken int64) (bool, error)
 	Renew(key string, owner string, fencingToken int64, ttl time.Duration) (bool, error)
 	Get(key string) (*Lock, error)
+	Subscribe() chan LockEvent
+	Unsubscribe(chan LockEvent)
 }
 
 // InMemoryStore is a thread-safe, local implementation of LockBackend.
@@ -42,6 +49,10 @@ type InMemoryStore struct {
 	waitingFor    map[string]string // owner -> key
 	tokenCounter  int64
 	deadlockCount int64
+
+	// Pub/Sub
+	listenersMu sync.Mutex
+	listeners   []chan LockEvent
 }
 
 // NewInMemoryStore initializes and returns a local LockBackend.
@@ -53,6 +64,38 @@ func NewInMemoryStore() *InMemoryStore {
 	}
 	go store.startExpiryCleaner(1 * time.Second)
 	return store
+}
+
+func (s *InMemoryStore) Subscribe() chan LockEvent {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	ch := make(chan LockEvent, 10)
+	s.listeners = append(s.listeners, ch)
+	return ch
+}
+
+func (s *InMemoryStore) Unsubscribe(ch chan LockEvent) {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	for i, l := range s.listeners {
+		if l == ch {
+			s.listeners = append(s.listeners[:i], s.listeners[i+1:]...)
+			close(ch)
+			break
+		}
+	}
+}
+
+func (s *InMemoryStore) broadcast(event LockEvent) {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	for _, ch := range s.listeners {
+		select {
+		case ch <- event:
+		default:
+			// If channel buffer is full, drop event to prevent blocking
+		}
+	}
 }
 
 // Acquire requests a lock for a key. Returns error if already acquired and not expired.
@@ -67,7 +110,6 @@ func (s *InMemoryStore) AcquireWithWait(key string, owner string, clientID strin
 	existing, exists := s.locks[key]
 	if exists && existing.ExpiresAt.After(now) {
 		if existing.Owner == owner && existing.ClientID == clientID {
-			// Reentrant behavior: increment count and extend lock duration
 			existing.ReentrancyCount++
 			existing.ExpiresAt = now.Add(ttl)
 			s.mu.Unlock()
@@ -79,14 +121,12 @@ func (s *InMemoryStore) AcquireWithWait(key string, owner string, clientID strin
 			return nil, fmt.Errorf("lock for key %q is held by owner %q", key, existing.Owner)
 		}
 
-		// Deadlock Cycle Detection
 		if s.hasCycleLocked(existing.Owner, owner) {
 			s.deadlockCount++
 			s.mu.Unlock()
 			return nil, fmt.Errorf("deadlock detected: cycle in lock wait queue")
 		}
 
-		// Queue the waiter
 		w := &waiter{
 			owner:    owner,
 			clientID: clientID,
@@ -104,7 +144,6 @@ func (s *InMemoryStore) AcquireWithWait(key string, owner string, clientID strin
 			s.mu.Unlock()
 			return lock, nil
 		case <-time.After(waitTimeout):
-			// Timeout expired: remove from waiter queue
 			s.mu.Lock()
 			delete(s.waitingFor, owner)
 			q := s.waiters[key]
@@ -147,13 +186,11 @@ func (s *InMemoryStore) hasCycleLocked(startOwner, targetOwner string) bool {
 		}
 		visited[current] = true
 
-		// Find what key current is waiting for
 		waitKey, waiting := s.waitingFor[current]
 		if !waiting {
 			break
 		}
 
-		// Find who owns waitKey
 		lock, exists := s.locks[waitKey]
 		if !exists || lock.ExpiresAt.Before(time.Now()) {
 			break
@@ -189,6 +226,7 @@ func (s *InMemoryStore) Release(key string, owner string, fencingToken int64) (b
 
 	delete(s.locks, key)
 	s.grantNextWaiterLocked(key)
+	s.broadcast(LockEvent{Key: key, Action: "released"})
 	return true, nil
 }
 
@@ -232,7 +270,6 @@ func (s *InMemoryStore) grantNextWaiterLocked(key string) {
 		return
 	}
 
-	// Pop the first waiter
 	w := q[0]
 	if len(q) > 1 {
 		s.waiters[key] = q[1:]
@@ -264,6 +301,7 @@ func (s *InMemoryStore) startExpiryCleaner(interval time.Duration) {
 			if v.ExpiresAt.Before(now) {
 				delete(s.locks, k)
 				s.grantNextWaiterLocked(k)
+				s.broadcast(LockEvent{Key: k, Action: "expired"})
 			}
 		}
 		s.mu.Unlock()

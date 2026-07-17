@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -624,5 +625,32 @@ func TestAPIKeyMiddleware(t *testing.T) {
 	handler.ServeHTTP(rr3, req3)
 	if rr3.Code != http.StatusOK {
 		t.Errorf("expected status 200, got %d", rr3.Code)
+	}
+}
+
+func TestLockEventSSE(t *testing.T) {
+	Store = storage.NewInMemoryStore()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := httptest.NewRequest("GET", "/api/locks/subscribe", nil).WithContext(reqCtx)
+	rr := httptest.NewRecorder()
+
+	go func() {
+		HandleLockSubscribe(rr, req)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	Store.Acquire("sse-resource", "client-sse", "session-sse", 5*time.Second)
+	Store.Release("sse-resource", "client-sse", 0)
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "released") || !strings.Contains(body, "sse-resource") {
+		t.Errorf("expected SSE body to contain sse-resource release action, got: %s", body)
 	}
 }

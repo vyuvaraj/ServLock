@@ -229,3 +229,35 @@ func HandleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE servlock_deadlocks_total counter\n")
 	fmt.Fprintf(w, "servlock_deadlocks_total %d\n", deadlockCount)
 }
+
+func HandleLockSubscribe(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := Store.Subscribe()
+	defer Store.Unsubscribe(ch)
+
+	fmt.Fprintf(w, ": keep-alive\n\n")
+	flusher.Flush()
+
+	ctx := r.Context()
+	for {
+		select {
+		case event := <-ch:
+			data, err := json.Marshal(event)
+			if err == nil {
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}

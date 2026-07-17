@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"log"
 	"net/http"
@@ -22,6 +24,9 @@ type Config struct {
 	Backend  string `yaml:"backend"`
 	FilePath string `yaml:"file_path"`
 	APIKey   string `yaml:"api_key"`
+	TLSCert  string `yaml:"tls_cert"`
+	TLSKey   string `yaml:"tls_key"`
+	ClientCA string `yaml:"client_ca"`
 }
 
 func main() {
@@ -73,6 +78,7 @@ func main() {
 	mux.HandleFunc("/api/locks/renew", handlers.HandleRenewLock)
 	mux.HandleFunc("/api/locks/observability", handlers.HandleLockObservability)
 	mux.HandleFunc("/api/locks/metrics", handlers.HandleMetrics)
+	mux.HandleFunc("/api/locks/subscribe", handlers.HandleLockSubscribe)
 
 	// Wrapper handler for /api/v1/ prefix rewriting (V1.1 support)
 	v1Wrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -136,9 +142,33 @@ func main() {
 		Handler: serverHandler,
 	}
 
+	// Set up TLS/mTLS configuration if certs are provided
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		tlsConfig := &tls.Config{}
+		if cfg.ClientCA != "" {
+			caCert, err := os.ReadFile(cfg.ClientCA)
+			if err != nil {
+				log.Fatalf("failed to read client CA file: %v", err)
+			}
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			tlsConfig.ClientCAs = caCertPool
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			log.Println("mTLS client verification enabled.")
+		}
+		server.TLSConfig = tlsConfig
+	}
+
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe failed: %v", err)
+		if server.TLSConfig != nil {
+			log.Printf("Starting HTTPS server on port %s...", cfg.Port)
+			if err := server.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("ListenAndServeTLS failed: %v", err)
+			}
+		} else {
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("ListenAndServe failed: %v", err)
+			}
 		}
 	}()
 
