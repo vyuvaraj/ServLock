@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"servlock/pkg/storage"
-
-	"github.com/vyuvaraj/ServShared"
 )
 
 type LockRequest struct {
@@ -18,6 +16,8 @@ type LockRequest struct {
 	FencingToken int64  `json:"fencing_token"`
 	Duration     int    `json:"duration_ms"` // Lease TTL in milliseconds
 	WaitTime     int    `json:"wait_ms"`     // Optional block/wait timeout in milliseconds
+	Mode         string `json:"mode"`        // "shared" or "exclusive"
+	Priority     int    `json:"priority"`
 }
 
 type LockResponse struct {
@@ -54,9 +54,9 @@ func HandleAcquireLock(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if req.WaitTime > 0 {
 		waitTimeout := time.Duration(req.WaitTime) * time.Millisecond
-		lock, err = Store.AcquireWithWait(req.Key, req.Owner, req.ClientID, ttl, waitTimeout)
+		lock, err = Store.AcquireAdvancedWithWait(req.Key, req.Owner, req.ClientID, ttl, waitTimeout, req.Priority, req.Mode)
 	} else {
-		lock, err = Store.Acquire(req.Key, req.Owner, req.ClientID, ttl)
+		lock, err = Store.AcquireAdvanced(req.Key, req.Owner, req.ClientID, ttl, req.Mode)
 	}
 
 	if err != nil {
@@ -89,9 +89,19 @@ func HandleReleaseLock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Key == "" || req.Owner == "" {
+		httpError(w, r, "Key and Owner are required fields", http.StatusBadRequest)
+		return
+	}
+
 	released, err := Store.Release(req.Key, req.Owner, req.FencingToken)
 	if err != nil {
-		httpError(w, r, err.Error(), http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(LockResponse{
+			Status:  "failed",
+			Message: err.Error(),
+		})
 		return
 	}
 
@@ -119,6 +129,11 @@ func HandleRenewLock(w http.ResponseWriter, r *http.Request) {
 	var req LockRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, r, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if req.Key == "" || req.Owner == "" {
+		httpError(w, r, "Key and Owner are required fields", http.StatusBadRequest)
 		return
 	}
 
@@ -153,29 +168,6 @@ func HandleRenewLock(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func httpError(w http.ResponseWriter, r *http.Request, msg string, status int) {
-	var errorCode string
-	switch status {
-	case http.StatusMethodNotAllowed:
-		errorCode = "ERR_METHOD_NOT_ALLOWED"
-	case http.StatusBadRequest:
-		errorCode = "ERR_BAD_REQUEST"
-	case http.StatusUnauthorized:
-		errorCode = "ERR_UNAUTHORIZED"
-	case http.StatusForbidden:
-		errorCode = "ERR_FORBIDDEN"
-	case http.StatusNotFound:
-		errorCode = "ERR_NOT_FOUND"
-	case http.StatusConflict:
-		errorCode = "ERR_CONFLICT"
-	case http.StatusNotImplemented:
-		errorCode = "ERR_NOT_IMPLEMENTED"
-	default:
-		errorCode = "ERR_INTERNAL_SERVER_ERROR"
-	}
-	ServShared.WriteJSONError(w, r, msg, errorCode, status)
-}
-
 func HandleLockObservability(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		httpError(w, r, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -184,7 +176,14 @@ func HandleLockObservability(w http.ResponseWriter, r *http.Request) {
 
 	ims, ok := Store.(*storage.InMemoryStore)
 	if !ok {
-		httpError(w, r, "Observability is only supported for InMemoryStore", http.StatusNotImplemented)
+		// If using file-backed store, we cast its embedded InMemoryStore
+		if fbs, isFile := Store.(*storage.FileLockStore); isFile {
+			ims = fbs.InMemoryStore
+		}
+	}
+
+	if ims == nil {
+		httpError(w, r, "Observability is only supported for InMemory or File stores", http.StatusNotImplemented)
 		return
 	}
 
@@ -192,6 +191,15 @@ func HandleLockObservability(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(locks)
+}
+
+func httpError(w http.ResponseWriter, r *http.Request, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(LockResponse{
+		Status:  "failed",
+		Message: msg,
+	})
 }
 
 func HandleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +210,12 @@ func HandleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	ims, ok := Store.(*storage.InMemoryStore)
 	if !ok {
+		if fbs, isFile := Store.(*storage.FileLockStore); isFile {
+			ims = fbs.InMemoryStore
+		}
+	}
+
+	if ims == nil {
 		httpError(w, r, "Metrics are only supported for InMemoryStore", http.StatusNotImplemented)
 		return
 	}
@@ -260,4 +274,28 @@ func HandleLockSubscribe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+type HeartbeatRequest struct {
+	ClientID string `json:"client_id"`
+}
+
+func HandleHeartbeatPing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, r, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req HeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, r, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.ClientID == "" {
+		httpError(w, r, "client_id is required", http.StatusBadRequest)
+		return
+	}
+	Store.PingHeartbeat(req.ClientID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"success"}`))
 }

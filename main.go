@@ -79,6 +79,7 @@ func main() {
 	mux.HandleFunc("/api/locks/observability", handlers.HandleLockObservability)
 	mux.HandleFunc("/api/locks/metrics", handlers.HandleMetrics)
 	mux.HandleFunc("/api/locks/subscribe", handlers.HandleLockSubscribe)
+	mux.HandleFunc("/api/locks/heartbeat", handlers.HandleHeartbeatPing)
 
 	// Wrapper handler for /api/v1/ prefix rewriting (V1.1 support)
 	v1Wrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

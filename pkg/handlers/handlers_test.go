@@ -654,3 +654,82 @@ func TestLockEventSSE(t *testing.T) {
 		t.Errorf("expected SSE body to contain sse-resource release action, got: %s", body)
 	}
 }
+
+func TestPriorityWaitQueue(t *testing.T) {
+	Store = storage.NewInMemoryStore()
+
+	// Acquire lock by Owner A
+	Store.AcquireAdvanced("priority-key", "owner-A", "client-A", 10*time.Second, "exclusive")
+
+	// Waiter B with priority 10
+	go func() {
+		Store.AcquireAdvancedWithWait("priority-key", "owner-B", "client-B", 10*time.Second, 5*time.Second, 10, "exclusive")
+	}()
+
+	// Waiter C with priority 50
+	go func() {
+		Store.AcquireAdvancedWithWait("priority-key", "owner-C", "client-C", 10*time.Second, 5*time.Second, 50, "exclusive")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Release lock by Owner A -> next waiter should be Owner C because priority 50 > 10
+	Store.Release("priority-key", "owner-A", 0)
+
+	time.Sleep(50 * time.Millisecond)
+
+	lock, err := Store.Get("priority-key")
+	if err != nil {
+		t.Fatalf("failed to retrieve lock: %v", err)
+	}
+	if lock.Owner != "owner-C" {
+		t.Errorf("expected owner-C with priority 50 to acquire lock, got %q", lock.Owner)
+	}
+}
+
+func TestSharedLockMode(t *testing.T) {
+	Store = storage.NewInMemoryStore()
+
+	// 1. Acquire shared lock by client A
+	l1, err := Store.AcquireAdvanced("shared-key", "owner-A", "client-A", 5*time.Second, "shared")
+	if err != nil || l1.Mode != "shared" {
+		t.Fatalf("failed to acquire shared lock A: %v", err)
+	}
+
+	// 2. Acquire shared lock by client B (should be allowed since compatible mode)
+	_, err = Store.AcquireAdvanced("shared-key", "owner-B", "client-B", 5*time.Second, "shared")
+	if err != nil {
+		t.Fatalf("failed to acquire shared lock B: %v", err)
+	}
+
+	// 3. Attempt exclusive lock by client C (should conflict and fail)
+	_, err = Store.AcquireAdvanced("shared-key", "owner-C", "client-C", 5*time.Second, "exclusive")
+	if err == nil {
+		t.Error("expected exclusive lock acquisition to fail due to active shared locks")
+	}
+}
+
+func TestHeartbeatTimeout(t *testing.T) {
+	Store = storage.NewInMemoryStore()
+
+	// Acquire lock with Client ID
+	_, err := Store.AcquireAdvanced("hb-key", "owner-hb", "client-hb", 10*time.Second, "exclusive")
+	if err != nil {
+		t.Fatalf("failed to acquire lock: %v", err)
+	}
+
+	// Register heartbeat
+	Store.PingHeartbeat("client-hb")
+
+	// Trigger a simulated stale timeout check using the ExpireHeartbeatForTest helper
+	Store.ExpireHeartbeatForTest("client-hb")
+
+	// Wait for background cleaner tick (cleaner runs every 500ms)
+	time.Sleep(800 * time.Millisecond)
+
+	// Verify lock was garbage-collected due to heartbeat failure
+	_, err = Store.Get("hb-key")
+	if err == nil {
+		t.Error("expected lock to be released due to client heartbeat timeout")
+	}
+}
